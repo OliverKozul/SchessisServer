@@ -3,6 +3,7 @@ from pydantic import BaseModel
 import psycopg2
 import os
 import logging
+from datetime import datetime
 
 logger = logging.getLogger("uvicorn")
 
@@ -27,6 +28,16 @@ def init_db():
             elo INTEGER DEFAULT 1000,
             wins INTEGER DEFAULT 0,
             losses INTEGER DEFAULT 0
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id SERIAL PRIMARY KEY,
+            player_id TEXT,
+            opponent_id TEXT,
+            result BOOLEAN,
+            timestamp TIMESTAMP DEFAULT NOW(),
+            FOREIGN KEY (player_id) REFERENCES players (steam_id) ON DELETE CASCADE
         )
     """)
     conn.commit()
@@ -90,6 +101,30 @@ def update_player(player):
     cur.close()
     conn.close()
 
+def add_match_history(player_id, opponent_id, won):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO match_history (player_id, opponent_id, result, timestamp)
+        VALUES (%s, %s, %s, %s)
+    """, (player_id, opponent_id, won, datetime.utcnow()))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_match_history(steam_id: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT opponent_id, result, timestamp 
+        FROM match_history
+        WHERE player_id = %s
+        ORDER BY timestamp DESC
+    """, (steam_id,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{"opponent_id": r[0], "won": r[1], "timestamp": r[2]} for r in rows]
 
 def calculate_elo(player_rating, opponent_rating, won):
     expected = 1 / (1 + 10 ** ((opponent_rating - player_rating) / 400))
@@ -122,9 +157,11 @@ def report_result(result: MatchResult):
     else:
         player["losses"] += 1
     update_player(player)
-    logger.info(f"Player {player['steam_id']} new Elo: {player['elo']}")
 
-    # If opponent is human, update their rating too
+    # Save match history
+    add_match_history(player["steam_id"], result.opponent_id, result.won)
+
+    # If opponent is human, update their rating and history too
     if opponent is not None:
         new_opponent_elo = calculate_elo(opponent["elo"], player["elo"], not result.won)
         opponent["elo"] = new_opponent_elo
@@ -133,7 +170,8 @@ def report_result(result: MatchResult):
         else:
             opponent["losses"] += 1
         update_player(opponent)
-        logger.info(f"Opponent {opponent['steam_id']} new Elo: {opponent['elo']}")
+
+        add_match_history(opponent["steam_id"], player["steam_id"], not result.won)
 
     return {"player": player, "opponent": opponent if opponent else "AI"}
 
@@ -143,4 +181,5 @@ def get_player_info(steam_id: str):
     player = get_player(steam_id)
     if not player:
         raise HTTPException(status_code=404, detail="Player not found")
-    return player
+    history = get_match_history(steam_id)
+    return {"player": player, "history": history}
