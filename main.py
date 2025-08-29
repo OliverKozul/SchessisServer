@@ -238,4 +238,4 @@ async def find_opponent(request: QueueRequest):
             return {"status": "found_opponent", "opponent": opponent_data}
 
     logger.info(f"No opponent found for {request.steam_id}")
-    return {"status": "waiting_for_opponent"}
+    return {"status": "waiting_for_opponent", "player_count": len(matchmaking_queue)}
