@@ -1,9 +1,11 @@
+import asyncio
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import psycopg2
 import os
 import logging
 from datetime import datetime
+from typing import Dict
 
 logger = logging.getLogger("uvicorn")
 
@@ -15,6 +17,7 @@ K = 32  # sensitivity constant for Elo
 # Database setup
 # --------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")  # Render injects this
+matchmaking_queue: Dict[str, Dict] = {}  # steam_id -> player_data
 
 def get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
@@ -68,6 +71,9 @@ class MatchResult(BaseModel):
     opponent_is_ai: bool = False
     ai_rating: int = 1000
 
+class QueueRequest(BaseModel):
+    steam_id: str
+    steam_lobby_id: str
 
 # --------------------------
 # Helpers
@@ -183,3 +189,55 @@ def get_player_info(steam_id: str):
         raise HTTPException(status_code=404, detail="Player not found")
     history = get_match_history(steam_id)
     return {"player": player, "history": history}
+
+
+# --------------------------
+# Matchmaking API endpoints
+# --------------------------
+@app.post("/queue")
+async def join_queue(request: QueueRequest):
+    """Add a player to the matchmaking queue"""
+    # Get player data
+    player = get_player(request.steam_id)
+    
+    # Add to queue if not already there
+    if request.steam_id not in matchmaking_queue:
+        matchmaking_queue[request.steam_id] = {
+            "steam_id": request.steam_id,
+            "elo": player["elo"],
+            "steam_lobby_id": request.steam_lobby_id,
+            "joined_at": datetime.utcnow()
+        }
+        logger.info(f"Player {request.steam_id} joined queue")
+    
+    return {"status": "in_queue", "position": len(matchmaking_queue)}
+
+@app.post("/leave_queue")
+async def leave_queue(request: QueueRequest):
+    """Remove a player from the matchmaking queue"""
+    if request.steam_id in matchmaking_queue:
+        del matchmaking_queue[request.steam_id]
+        logger.info(f"Player {request.steam_id} left queue")
+    
+    return {"status": "left_queue"}
+
+@app.get("/find_opponent")
+async def find_opponent(request: QueueRequest):
+    """Find a suitable opponent for the player"""
+    if request.steam_id not in matchmaking_queue:
+        return {"status": "not_in_queue"}
+
+    player_data = matchmaking_queue[request.steam_id]
+    player_elo = player_data["elo"]
+
+    # Find an opponent with a similar Elo rating
+    while True:
+        for opponent_id, opponent_data in matchmaking_queue.items():
+            if opponent_id != request.steam_id and abs(opponent_data["elo"] - player_elo) < 100:
+                # Found a suitable opponent
+                logger.info(f"Found opponent for {request.steam_id}: {opponent_id}")
+                return {"status": "found_opponent", "opponent": opponent_data}
+
+        # If no opponent is found, wait for a while before checking again
+        logger.info(f"No opponent found for {request.steam_id}, waiting...")
+        await asyncio.sleep(5)
