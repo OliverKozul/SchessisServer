@@ -231,13 +231,11 @@ async def find_opponent(request: QueueRequest):
     player_elo = player_data["elo"]
 
     # Find an opponent with a similar Elo rating
-    while True:
-        for opponent_id, opponent_data in matchmaking_queue.items():
-            if opponent_id != request.steam_id and abs(opponent_data["elo"] - player_elo) < 100:
-                # Found a suitable opponent
-                logger.info(f"Found opponent for {request.steam_id}: {opponent_id}")
-                return {"status": "found_opponent", "opponent": opponent_data}
+    for opponent_id, opponent_data in matchmaking_queue.items():
+        if opponent_id != request.steam_id and abs(opponent_data["elo"] - player_elo) < 100:
+            # Found a suitable opponent
+            logger.info(f"Found opponent for {request.steam_id}: {opponent_id}")
+            return {"status": "found_opponent", "opponent": opponent_data}
 
-        # If no opponent is found, wait for a while before checking again
-        logger.info(f"No opponent found for {request.steam_id}, waiting...")
-        await asyncio.sleep(5)
+    logger.info(f"No opponent found for {request.steam_id}")
+    return {"status": "waiting_for_opponent"}
