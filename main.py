@@ -100,9 +100,12 @@ def get_player(steam_id: str, steam_name: str = "Anon"):
     cur = conn.cursor()
     cur.execute("SELECT steam_id, steam_name, elo, wins, losses FROM players WHERE steam_id = %s", (steam_id,))
     row = cur.fetchone()
-    if row and steam_name != "Anon" and row[1] != steam_name:
-        update_player({"steam_id": steam_id, "steam_name": steam_name, "elo": row[2], "wins": row[3], "losses": row[4]})
-        player = {"steam_id": row[0], "steam_name": steam_name, "elo": row[2], "wins": row[3], "losses": row[4]}
+    if row:
+        if steam_name != "Anon" and row[1] != steam_name:
+            update_player({"steam_id": steam_id, "steam_name": steam_name, "elo": row[2], "wins": row[3], "losses": row[4]})
+            player = {"steam_id": steam_id, "steam_name": steam_name, "elo": row[2], "wins": row[3], "losses": row[4]}
+        else:
+            player = {"steam_id": row[0], "steam_name": row[1], "elo": row[2], "wins": row[3], "losses": row[4]}
     else:
         player = {"steam_id": steam_id, "steam_name": steam_name, "elo": 1000, "wins": 0, "losses": 0}
         cur.execute("INSERT INTO players (steam_id, steam_name, elo, wins, losses) VALUES (%s, %s, %s, %s, %s)", 
