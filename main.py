@@ -1,5 +1,6 @@
 import asyncio
 from fastapi import FastAPI, HTTPException
+from fastapi.params import Query
 from pydantic import BaseModel
 import psycopg2
 import os
@@ -28,6 +29,7 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS players (
             steam_id TEXT PRIMARY KEY,
+            steam_name TEXT,
             elo INTEGER DEFAULT 1000,
             wins INTEGER DEFAULT 0,
             losses INTEGER DEFAULT 0
@@ -78,17 +80,17 @@ class QueueRequest(BaseModel):
 # --------------------------
 # Helpers
 # --------------------------
-def get_player(steam_id: str):
+def get_player(steam_id: str, steam_name: str = "Anon"):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT steam_id, elo, wins, losses FROM players WHERE steam_id = %s", (steam_id,))
+    cur.execute("SELECT steam_id, steam_name, elo, wins, losses FROM players WHERE steam_id = %s", (steam_id,))
     row = cur.fetchone()
     if row:
-        player = {"steam_id": row[0], "elo": row[1], "wins": row[2], "losses": row[3]}
+        player = {"steam_id": row[0], "steam_name": row[1], "elo": row[2], "wins": row[3], "losses": row[4]}
     else:
-        player = {"steam_id": steam_id, "elo": 1000, "wins": 0, "losses": 0}
-        cur.execute("INSERT INTO players (steam_id, elo, wins, losses) VALUES (%s, %s, %s, %s)", 
-                    (steam_id, 1000, 0, 0))
+        player = {"steam_id": steam_id, "steam_name": steam_name, "elo": 1000, "wins": 0, "losses": 0}
+        cur.execute("INSERT INTO players (steam_id, steam_name, elo, wins, losses) VALUES (%s, %s, %s, %s, %s)", 
+                    (steam_id, steam_name, 1000, 0, 0))
         conn.commit()
     cur.close()
     conn.close()
@@ -100,9 +102,9 @@ def update_player(player):
     cur = conn.cursor()
     cur.execute("""
         UPDATE players
-        SET elo = %s, wins = %s, losses = %s
+        SET steam_name = %s, elo = %s, wins = %s, losses = %s
         WHERE steam_id = %s
-    """, (player["elo"], player["wins"], player["losses"], player["steam_id"]))
+    """, (player["steam_name"], player["elo"], player["wins"], player["losses"], player["steam_id"]))
     conn.commit()
     cur.close()
     conn.close()
@@ -135,7 +137,7 @@ def get_match_history(steam_id: str):
 def calculate_elo(player_rating, opponent_rating, won):
     expected = 1 / (1 + 10 ** ((opponent_rating - player_rating) / 400))
     score = 1 if won else 0
-    return round(player_rating + K * (score - expected))
+    return max(round(player_rating + K * (score - expected)), 0)
 
 
 # --------------------------
@@ -183,8 +185,8 @@ def report_result(result: MatchResult):
 
 
 @app.get("/get_player/{steam_id}")
-def get_player_info(steam_id: str):
-    player = get_player(steam_id)
+def get_player_info(steam_id: str, steam_name: str = Query(None)):
+    player = get_player(steam_id, steam_name)
     if not player:
         raise HTTPException(status_code=404, detail="Player not found")
     history = get_match_history(steam_id)
@@ -239,3 +241,22 @@ async def find_opponent(request: QueueRequest):
 
     logger.info(f"No opponent found for {request.steam_id}")
     return {"status": "waiting_for_opponent", "player_count": len(matchmaking_queue)}
+
+@app.get("/leaderboard")
+def get_leaderboard():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT steam_id, steam_name, elo, wins, losses FROM players ORDER BY elo DESC LIMIT 10")
+    rows = cur.fetchall()
+    leaderboard = []
+    for row in rows:
+        leaderboard.append({
+            "steam_id": row[0],
+            "steam_name": row[1],
+            "elo": row[2],
+            "wins": row[3],
+            "losses": row[4]
+        })
+    cur.close()
+    conn.close()
+    return {"leaderboard": leaderboard}
