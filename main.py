@@ -26,6 +26,7 @@ def get_conn():
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
+    
     cur.execute("""
         CREATE TABLE IF NOT EXISTS players (
             steam_id TEXT PRIMARY KEY,
@@ -45,6 +46,20 @@ def init_db():
             FOREIGN KEY (player_id) REFERENCES players (steam_id) ON DELETE CASCADE
         )
     """)
+
+    cur.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='players' AND column_name='steam_name'
+            ) THEN
+                ALTER TABLE players ADD COLUMN steam_name TEXT;
+            END IF;
+        END
+        $$;
+    """)
+
     conn.commit()
     cur.close()
     conn.close()
