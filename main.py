@@ -229,6 +229,7 @@ async def try_matchmaking_round():
                     "type": "match_found",
                     "match_id": match_id,
                     "opponent_id": b_id,
+                    "opponent_name": b_entry.get("steam_name"),
                     "opponent_elo": b_entry["elo"],
                     "host": host
                 }
@@ -236,6 +237,7 @@ async def try_matchmaking_round():
                     "type": "match_found",
                     "match_id": match_id,
                     "opponent_id": a_id,
+                    "opponent_name": a_entry.get("steam_name"),
                     "opponent_elo": a_entry["elo"],
                     "host": host
                 }
@@ -340,8 +342,8 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                 async with ws_lock:
                     target_ws = ws_connections.get(opponent_id)
                 if target_ws:
-                    logger.info(f"Forwarding relay from {steam_id} to {opponent_id}: {fwd}")
                     fwd = {"type": "relay", "from": steam_id, "action": action, "payload": payload, "match_id": match_id}
+                    logger.info(f"Forwarding relay from {steam_id} to {opponent_id}: {fwd}")
                     try:
                         await target_ws.send_text(json.dumps(fwd))
                     except Exception:
