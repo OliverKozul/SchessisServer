@@ -451,7 +451,7 @@ async def get_player_info(steam_id: str):
         raise HTTPException(status_code=404, detail="Player not found")
     # fetch history
     history = await asyncio.to_thread(lambda: [
-        {"opponent_id": r[0], "won": r[1], "timestamp": r[2].isoformat()}
+        {"opponent_id": r["opponent_id"], "won": r["won"], "timestamp": r["timestamp"].isoformat()}
         for r in get_match_history(steam_id)
     ])
     return {"player": p, "history": history}
