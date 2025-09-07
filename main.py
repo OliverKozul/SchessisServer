@@ -320,22 +320,27 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                 match_id = msg.get("match_id")
                 action = msg.get("action")
                 payload = msg.get("payload", {})
+                logger.info(f"Relay from {steam_id} in match {match_id}: action={action}")
                 if not match_id or action not in ("left", "right"):
+                    logger.warning(f"Invalid relay from {steam_id} in match {match_id}: action={action}")
                     continue
                 # verify membership
                 async with match_lock:
                     mid = player_match_map.get(steam_id)
                     if mid != match_id:
                         # not in match or mismatch
+                        logger.warning(f"Relay from {steam_id} for invalid match {match_id}. Match does not match map.")
                         continue
                     match = matches.get(match_id)
                     if not match:
+                        logger.warning(f"Relay from {steam_id} for invalid match {match_id}. Match does not exist.")
                         continue
                     # determine opponent id
                     opponent_id = match["b"] if match["a"] == steam_id else match["a"]
                 async with ws_lock:
                     target_ws = ws_connections.get(opponent_id)
                 if target_ws:
+                    logger.info(f"Forwarding relay from {steam_id} to {opponent_id}: {fwd}")
                     fwd = {"type": "relay", "from": steam_id, "action": action, "payload": payload, "match_id": match_id}
                     try:
                         await target_ws.send_text(json.dumps(fwd))
