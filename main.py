@@ -323,7 +323,7 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                 action = msg.get("action")
                 payload = msg.get("payload", {})
                 logger.info(f"Relay from {steam_id} in match {match_id}: action={action}")
-                if not match_id or action not in ("left", "right", "start_game"):
+                if not match_id or action not in ("start_game", "left_click", "right_click", "fetch_player_info", "color_chosen", "draft_end_started", "random_draft_requested", "yes_rematch", "no_rematch", "disable_clicking"):
                     logger.warning(f"Invalid relay from {steam_id} in match {match_id}: action={action}")
                     continue
                 # verify membership
