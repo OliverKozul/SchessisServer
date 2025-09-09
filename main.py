@@ -189,6 +189,7 @@ def _find_opponent_locked(idx: int) -> Optional[str]:
 async def attempt_instant_match(steam_id: str, idx: Optional[int] = None):
     """Attempt to form a match for steam_id using optional precomputed idx."""
     async with queue_lock:
+        global matchmaking_sorted
         if idx is None:
             idx = next((i for i, (_, sid) in enumerate(matchmaking_sorted) if sid == steam_id), None)
         if idx is None:
@@ -204,7 +205,6 @@ async def attempt_instant_match(steam_id: str, idx: Optional[int] = None):
         host = a_id if a_id < b_id else b_id
         match_id = uuid.uuid4().hex
         remove_set = {a_id, b_id}
-        global matchmaking_sorted
         matchmaking_sorted = [t for t in matchmaking_sorted if t[1] not in remove_set]
         matchmaking_queue.pop(a_id, None)
         matchmaking_queue.pop(b_id, None)
