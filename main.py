@@ -288,6 +288,10 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                 await websocket.send_text(json.dumps({"type": "pong"}))
                 continue
 
+            if mtype == "player_count":
+                await websocket.send_text(json.dumps({"type": "player_count", "count": len(matchmaking_queue)}))
+                continue
+
             if mtype == "leave_queue":
                 await remove_from_queue(steam_id)
                 await websocket.send_text(json.dumps({"type": "left_queue"}))
