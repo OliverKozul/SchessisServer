@@ -59,7 +59,7 @@ async def init_db_async():
                     FOREIGN KEY (player_id) REFERENCES players (steam_id) ON DELETE CASCADE
                 )
             """)
-            # create matches table if missing
+
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS matches (
                     id SERIAL PRIMARY KEY,
@@ -74,13 +74,7 @@ async def init_db_async():
                     ended_at TIMESTAMP
                 )
             """)
-            # Ensure new columns exist for older DBs (safe to run every startup)
-            await conn.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ongoing'")
-            await conn.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS initial_board JSONB")
-            await conn.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS winner_id TEXT")
-            await conn.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS ended_at TIMESTAMP")
 
-            # create moves table (each move saved immediately)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS moves (
                     id SERIAL PRIMARY KEY,
@@ -161,6 +155,7 @@ async def insert_initial_board_async(match_id: str, initial_board: dict):
             "UPDATE matches SET initial_board = $1 WHERE match_id = $2",
             json.dumps(initial_board), match_id
         )
+        logger.info(f"Initial board saved for match {match_id}, data: {initial_board}")
 
 async def insert_move_async(match_id: str, player_id: str, move_data: dict):
     """
@@ -180,6 +175,7 @@ async def insert_move_async(match_id: str, player_id: str, move_data: dict):
                 """,
                 match_id, move_number, player_id, json.dumps(move_data), datetime.utcnow()
             )
+            logger.info(f"Move recorded for match {match_id}, player {player_id}, move {move_number}: {move_data}")
             return move_number  # useful if caller wants to ack the move number
         
 async def finalize_match(match_id: str, winner_id: Optional[str]):
@@ -434,6 +430,7 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                 try:
                     move_number = await insert_move_async(mid, steam_id, move)
                     # ack back to sender with move_number
+                    logger.info(f"Move {move_number} saved for match {mid} by {steam_id}")
                     await websocket.send_text(json.dumps({"type": "move_saved", "match_id": mid, "move_number": move_number}))
                 except Exception:
                     logger.exception("Failed to save move for match %s", mid)
@@ -488,6 +485,7 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                 # finalize match record
                 mid = player_match_map.get(steam_id)
                 await finalize_match(mid, steam_id if won else opponent_id)
+                logger.info(f"Match {mid} finalized. Winner: {steam_id if won else opponent_id}")
                 await websocket.send_text(json.dumps({"type": "reported"}))
                 continue
 
