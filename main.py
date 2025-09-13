@@ -59,6 +59,7 @@ async def init_db_async():
                     FOREIGN KEY (player_id) REFERENCES players (steam_id) ON DELETE CASCADE
                 )
             """)
+            # create matches table if missing
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS matches (
                     id SERIAL PRIMARY KEY,
@@ -66,7 +67,29 @@ async def init_db_async():
                     player1_id TEXT,
                     player2_id TEXT,
                     host_id TEXT,
-                    created_at TIMESTAMP DEFAULT NOW()
+                    status TEXT DEFAULT 'ongoing',
+                    initial_board JSONB,
+                    winner_id TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    ended_at TIMESTAMP
+                )
+            """)
+            # Ensure new columns exist for older DBs (safe to run every startup)
+            await conn.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ongoing'")
+            await conn.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS initial_board JSONB")
+            await conn.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS winner_id TEXT")
+            await conn.execute("ALTER TABLE matches ADD COLUMN IF NOT EXISTS ended_at TIMESTAMP")
+
+            # create moves table (each move saved immediately)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS moves (
+                    id SERIAL PRIMARY KEY,
+                    match_id TEXT,
+                    move_number INTEGER,
+                    player_id TEXT,
+                    move_data JSONB,
+                    timestamp TIMESTAMP DEFAULT NOW(),
+                    FOREIGN KEY (match_id) REFERENCES matches (match_id) ON DELETE CASCADE
                 )
             """)
 
@@ -120,15 +143,51 @@ async def add_match_history(player_id: str, opponent_id: str, won: bool):
         )
 
 async def insert_match_record(match_id: str, a: str, b: str, host: str):
+    """Insert a match record (status default 'ongoing')."""
     async with db_pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO matches (match_id, player1_id, player2_id, host_id, created_at)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO matches (match_id, player1_id, player2_id, host_id, created_at, status)
+            VALUES ($1, $2, $3, $4, $5, $6)
             """,
-            match_id, a, b, host, datetime.utcnow()
+            match_id, a, b, host, datetime.utcnow(), "ongoing"
         )
 
+async def insert_initial_board_async(match_id: str, initial_board: dict):
+    """Stores the initial board JSON into matches.initial_board (replaces if already present)."""
+    async with db_pool.acquire() as conn:
+        # store as JSONB
+        await conn.execute(
+            "UPDATE matches SET initial_board = $1 WHERE match_id = $2",
+            json.dumps(initial_board), match_id
+        )
+
+async def insert_move_async(match_id: str, player_id: str, move_data: dict):
+    """
+    Appends a move into moves table.
+    We determine move_number server-side to avoid tampering.
+    """
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            # get current count (lock scope is transaction so the number is stable for this insertion)
+            row = await conn.fetchrow("SELECT COUNT(*) AS cnt FROM moves WHERE match_id = $1", match_id)
+            current = row["cnt"] if row else 0
+            move_number = int(current) + 1
+            await conn.execute(
+                """
+                INSERT INTO moves (match_id, move_number, player_id, move_data, timestamp)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                match_id, move_number, player_id, json.dumps(move_data), datetime.utcnow()
+            )
+            return move_number  # useful if caller wants to ack the move number
+        
+async def finalize_match(match_id: str, winner_id: Optional[str]):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE matches SET status = $1, winner_id = $2, ended_at = $3 WHERE match_id = $4",
+            "finished", winner_id, datetime.utcnow(), match_id
+        )
 
 # Run DB init at startup using thread
 @app.on_event("startup")
@@ -289,7 +348,9 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                 continue
 
             if mtype == "player_count":
-                await websocket.send_text(json.dumps({"type": "player_count", "count": len(matchmaking_queue)}))
+                player_count = len(matchmaking_queue)
+                logger.info("Player count requested by %s: %d", steam_id, player_count)
+                await websocket.send_text(json.dumps({"type": "player_count", "count": player_count}))
                 continue
 
             if mtype == "leave_queue":
@@ -336,6 +397,67 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                         logger.exception("Failed to forward relay to %s", opponent_id)
                 continue
 
+            if mtype == "submit_board":
+                # Player sends initial board state. Validate they are in a match.
+                # Expected keys: white_piece_coords, white_piece_types, black_piece_coords, black_piece_types
+                mid = player_match_map.get(steam_id)
+                if not mid:
+                    await websocket.send_text(json.dumps({"type": "error", "reason": "not_in_match"}))
+                    continue
+                # Build initial_board structure we will store
+                board_payload = {
+                    "white_piece_coords": msg.get("white_piece_coords"),
+                    "white_piece_types": msg.get("white_piece_types"),
+                    "black_piece_coords": msg.get("black_piece_coords"),
+                    "black_piece_types": msg.get("black_piece_types"),
+                    "submitted_by": steam_id,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+                try:
+                    await insert_initial_board_async(mid, board_payload)
+                    await websocket.send_text(json.dumps({"type": "board_saved", "match_id": mid}))
+                except Exception:
+                    logger.exception("Failed to save initial board for match %s", mid)
+                    await websocket.send_text(json.dumps({"type": "error", "reason": "db_error"}))
+                continue
+
+            if mtype == "submit_move":
+                # Player submits one move. Server will persist then relay to opponent.
+                mid = player_match_map.get(steam_id)
+                if not mid:
+                    await websocket.send_text(json.dumps({"type": "error", "reason": "not_in_match"}))
+                    continue
+                move = msg.get("move")
+                if not move:
+                    await websocket.send_text(json.dumps({"type": "error", "reason": "bad_payload"}))
+                    continue
+                try:
+                    move_number = await insert_move_async(mid, steam_id, move)
+                    # ack back to sender with move_number
+                    await websocket.send_text(json.dumps({"type": "move_saved", "match_id": mid, "move_number": move_number}))
+                except Exception:
+                    logger.exception("Failed to save move for match %s", mid)
+                    await websocket.send_text(json.dumps({"type": "error", "reason": "db_error"}))
+                    continue
+
+                # # Now relay to opponent so they see the move in real-time
+                # async with match_lock:
+                #     match = matches.get(mid)
+                # if match:
+                #     opponent_id = match["b"] if match["a"] == steam_id else match["a"]
+                #     async with ws_lock:
+                #         opponent_ws = ws_connections.get(opponent_id)
+                # else:
+                #     opponent_ws = None
+
+                # fwd = {"type":"relay_move","from": steam_id, "move": move, "move_number": move_number, "match_id": mid}
+                # if opponent_ws:
+                #     try:
+                #         await opponent_ws.send_text(json.dumps(fwd))
+                #     except Exception:
+                #         logger.exception("Failed to forward move to %s", opponent_id)
+                continue
+
             if mtype == "report_result":
                 # optional: client can notify server of result; reuse existing report_result endpoint logic via thread
                 # message should include opponent_id and won bool
@@ -363,6 +485,9 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                     opp["losses"] += 1
                 await update_player(opp)
                 await add_match_history(opp["steam_id"], p["steam_id"], not won)
+                # finalize match record
+                mid = player_match_map.get(steam_id)
+                await finalize_match(mid, steam_id if won else opponent_id)
                 await websocket.send_text(json.dumps({"type": "reported"}))
                 continue
 
@@ -424,6 +549,9 @@ async def report_result(result: MatchResult):
         opponent["losses"] += 1
     await update_player(opponent)
     await add_match_history(opponent["steam_id"], p["steam_id"], not result.won)
+    # finalize match record
+    mid = player_match_map.get(opponent["steam_id"])
+    await finalize_match(mid, opponent["steam_id"] if not result.won else p["steam_id"])
     return {"player": p, "opponent": opponent}
 
 @app.get("/get_player/{steam_id}")
