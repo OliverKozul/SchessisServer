@@ -37,6 +37,9 @@ match_last_move: Dict[str, Dict[str, float]] = {}  # match_id -> {player_id: las
 match_time_tasks: Dict[str, asyncio.Task] = {}
 DEFAULT_PLAYER_TIME = 600.0  # 10 minutes in seconds
 
+# Track whose turn it is for each match
+match_turn: Dict[str, str] = {}  # match_id -> player_id
+
 
 ############################
 # Async DB helpers (asyncpg)
@@ -295,12 +298,18 @@ async def attempt_instant_match(steam_id: str, idx: Optional[int] = None):
         now = datetime.utcnow().timestamp()
         match_times[match_id] = {a_id: DEFAULT_PLAYER_TIME, b_id: DEFAULT_PLAYER_TIME}
         match_last_move[match_id] = {a_id: now, b_id: now}
+        # Set initial turn (host starts)
+        match_turn[match_id] = host
         async def time_broadcast_task():
             while True:
                 await asyncio.sleep(1)
                 times = match_times.get(match_id)
-                if not times:
+                turn = match_turn.get(match_id)
+                if not times or not turn:
                     break
+                # Decrement only the current player's clock
+                times[turn] = max(times[turn] - 1, 0)
+                # Broadcast times
                 for pid in [a_id, b_id]:
                     async with ws_lock:
                         ws = ws_connections.get(pid)
@@ -310,33 +319,34 @@ async def attempt_instant_match(steam_id: str, idx: Optional[int] = None):
                                 "type": "time_update",
                                 "match_id": match_id,
                                 "your_time": times.get(pid, 0),
-                                "opponent_time": times.get(b_id if pid == a_id else a_id, 0)
+                                "opponent_time": times.get(b_id if pid == a_id else a_id, 0),
+                                "turn": turn
                             }))
                         except Exception:
                             pass
                 # Check for time expiration
-                for pid in [a_id, b_id]:
-                    if times.get(pid, 0) <= 0:
-                        winner = b_id if pid == a_id else a_id
-                        await finalize_match(match_id, winner)
-                        logger.info(f"Match {match_id}: {pid} ran out of time. Winner: {winner}")
-                        for p in [a_id, b_id]:
-                            async with ws_lock:
-                                ws = ws_connections.get(p)
-                            if ws:
-                                try:
-                                    await ws.send_text(json.dumps({
-                                        "type": "time_expired",
-                                        "match_id": match_id,
-                                        "loser": pid,
-                                        "winner": winner
-                                    }))
-                                except Exception:
-                                    pass
-                        match_times.pop(match_id, None)
-                        match_last_move.pop(match_id, None)
-                        match_time_tasks.pop(match_id, None)
-                        return
+                if times[turn] <= 0:
+                    winner = b_id if turn == a_id else a_id
+                    await finalize_match(match_id, winner)
+                    logger.info(f"Match {match_id}: {turn} ran out of time. Winner: {winner}")
+                    for p in [a_id, b_id]:
+                        async with ws_lock:
+                            ws = ws_connections.get(p)
+                        if ws:
+                            try:
+                                await ws.send_text(json.dumps({
+                                    "type": "time_expired",
+                                    "match_id": match_id,
+                                    "loser": turn,
+                                    "winner": winner
+                                }))
+                            except Exception:
+                                pass
+                    match_times.pop(match_id, None)
+                    match_last_move.pop(match_id, None)
+                    match_time_tasks.pop(match_id, None)
+                    match_turn.pop(match_id, None)
+                    return
         match_time_tasks[match_id] = asyncio.create_task(time_broadcast_task())
 
 async def enqueue_player(steam_id: str, steam_name: str, elo: int, max_diff: int):
@@ -508,10 +518,13 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                                             "type": "time_update",
                                             "match_id": mid,
                                             "your_time": times[pid],
-                                            "opponent_time": times[b_id if pid == a_id else a_id]
+                                            "opponent_time": times[b_id if pid == a_id else a_id],
+                                            "turn": steam_id
                                         }))
                                     except Exception:
                                         pass
+                            # Switch turn to opponent
+                            match_turn[mid] = b_id if steam_id == a_id else a_id
                 except Exception:
                     logger.exception("Failed to save move for match %s", mid)
                     await websocket.send_text(json.dumps({"type": "error", "reason": "db_error"}))
@@ -582,6 +595,7 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
             task = match_time_tasks.pop(m_id, None)
             if task:
                 task.cancel()
+            match_turn.pop(m_id, None)
 
 
 # --------------------------
