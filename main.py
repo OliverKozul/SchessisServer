@@ -295,18 +295,17 @@ async def attempt_instant_match(steam_id: str, idx: Optional[int] = None):
 
     # Initialize per-player clocks and start timer task
     match_times[match_id] = {a_id: DEFAULT_PLAYER_TIME, b_id: DEFAULT_PLAYER_TIME}
-    # Set initial turn (host starts)
     match_turn[match_id] = host
     async def time_broadcast_task():
+        logger.info(f"Timer task started for match {match_id}")
         while True:
             await asyncio.sleep(1)
             times = match_times.get(match_id)
             turn = match_turn.get(match_id)
             if not times or not turn:
                 break
-            # Decrement only the current player's clock
+            logger.debug(f"Timer tick for match {match_id}: {turn} has {times[turn]}s left")
             times[turn] = max(times[turn] - 1, 0)
-            # Broadcast times
             for pid in [a_id, b_id]:
                 async with ws_lock:
                     ws = ws_connections.get(pid)
@@ -321,7 +320,6 @@ async def attempt_instant_match(steam_id: str, idx: Optional[int] = None):
                         }))
                     except Exception:
                         pass
-            # Check for time expiration
             if times[turn] <= 0:
                 winner = b_id if turn == a_id else a_id
                 await finalize_match(match_id, winner)
@@ -343,7 +341,7 @@ async def attempt_instant_match(steam_id: str, idx: Optional[int] = None):
                 match_time_tasks.pop(match_id, None)
                 match_turn.pop(match_id, None)
                 return
-        match_time_tasks[match_id] = asyncio.create_task(time_broadcast_task())
+    match_time_tasks[match_id] = asyncio.create_task(time_broadcast_task())
 
 async def enqueue_player(steam_id: str, steam_name: str, elo: int, max_diff: int):
     idx = None
