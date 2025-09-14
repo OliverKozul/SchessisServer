@@ -31,6 +31,12 @@ ws_lock = asyncio.Lock()
 
 db_pool: Optional[asyncpg.pool.Pool] = None
 
+# Per-match time tracking and timer tasks
+match_times: Dict[str, Dict[str, float]] = {}  # match_id -> {player_id: seconds_left}
+match_last_move: Dict[str, Dict[str, float]] = {}  # match_id -> {player_id: last_move_ts}
+match_time_tasks: Dict[str, asyncio.Task] = {}
+DEFAULT_PLAYER_TIME = 600.0  # 10 minutes in seconds
+
 
 ############################
 # Async DB helpers (asyncpg)
@@ -285,6 +291,54 @@ async def attempt_instant_match(steam_id: str, idx: Optional[int] = None):
         except Exception:
             logger.exception("Failed to send match_found to %s", b_id)
 
+        # Initialize per-player clocks and start timer task
+        now = datetime.utcnow().timestamp()
+        match_times[match_id] = {a_id: DEFAULT_PLAYER_TIME, b_id: DEFAULT_PLAYER_TIME}
+        match_last_move[match_id] = {a_id: now, b_id: now}
+        async def time_broadcast_task():
+            while True:
+                await asyncio.sleep(1)
+                times = match_times.get(match_id)
+                if not times:
+                    break
+                for pid in [a_id, b_id]:
+                    async with ws_lock:
+                        ws = ws_connections.get(pid)
+                    if ws:
+                        try:
+                            await ws.send_text(json.dumps({
+                                "type": "time_update",
+                                "match_id": match_id,
+                                "your_time": times.get(pid, 0),
+                                "opponent_time": times.get(b_id if pid == a_id else a_id, 0)
+                            }))
+                        except Exception:
+                            pass
+                # Check for time expiration
+                for pid in [a_id, b_id]:
+                    if times.get(pid, 0) <= 0:
+                        winner = b_id if pid == a_id else a_id
+                        await finalize_match(match_id, winner)
+                        logger.info(f"Match {match_id}: {pid} ran out of time. Winner: {winner}")
+                        for p in [a_id, b_id]:
+                            async with ws_lock:
+                                ws = ws_connections.get(p)
+                            if ws:
+                                try:
+                                    await ws.send_text(json.dumps({
+                                        "type": "time_expired",
+                                        "match_id": match_id,
+                                        "loser": pid,
+                                        "winner": winner
+                                    }))
+                                except Exception:
+                                    pass
+                        match_times.pop(match_id, None)
+                        match_last_move.pop(match_id, None)
+                        match_time_tasks.pop(match_id, None)
+                        return
+        match_time_tasks[match_id] = asyncio.create_task(time_broadcast_task())
+
 async def enqueue_player(steam_id: str, steam_name: str, elo: int, max_diff: int):
     idx = None
     async with queue_lock:
@@ -432,27 +486,36 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                     # ack back to sender with move_number
                     logger.info(f"Move {move_number} saved for match {mid} by {steam_id}")
                     await websocket.send_text(json.dumps({"type": "move_saved", "match_id": mid, "move_number": move_number}))
+                    # Update time left for moving player
+                    now = datetime.utcnow().timestamp()
+                    times = match_times.get(mid)
+                    last_moves = match_last_move.get(mid)
+                    if times and last_moves:
+                        elapsed = now - last_moves.get(steam_id, now)
+                        times[steam_id] = max(times[steam_id] - elapsed, 0)
+                        last_moves[steam_id] = now
+                        # Send immediate time update to both players
+                        match_obj = matches.get(mid)
+                        if match_obj:
+                            a_id = match_obj["a"]
+                            b_id = match_obj["b"]
+                            for pid in [a_id, b_id]:
+                                async with ws_lock:
+                                    ws = ws_connections.get(pid)
+                                if ws:
+                                    try:
+                                        await ws.send_text(json.dumps({
+                                            "type": "time_update",
+                                            "match_id": mid,
+                                            "your_time": times[pid],
+                                            "opponent_time": times[b_id if pid == a_id else a_id]
+                                        }))
+                                    except Exception:
+                                        pass
                 except Exception:
                     logger.exception("Failed to save move for match %s", mid)
                     await websocket.send_text(json.dumps({"type": "error", "reason": "db_error"}))
                     continue
-
-                # # Now relay to opponent so they see the move in real-time
-                # async with match_lock:
-                #     match = matches.get(mid)
-                # if match:
-                #     opponent_id = match["b"] if match["a"] == steam_id else match["a"]
-                #     async with ws_lock:
-                #         opponent_ws = ws_connections.get(opponent_id)
-                # else:
-                #     opponent_ws = None
-
-                # fwd = {"type":"relay_move","from": steam_id, "move": move, "move_number": move_number, "match_id": mid}
-                # if opponent_ws:
-                #     try:
-                #         await opponent_ws.send_text(json.dumps(fwd))
-                #     except Exception:
-                #         logger.exception("Failed to forward move to %s", opponent_id)
                 continue
 
             if mtype == "report_result":
@@ -513,6 +576,12 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                             await other_ws.send_text(json.dumps({"type": "match_cancelled", "match_id": m_id, "reason": "disconnect", "initiator": steam_id}))
                         except Exception:
                             pass
+            # Clean up time tracking and timer task
+            match_times.pop(m_id, None)
+            match_last_move.pop(m_id, None)
+            task = match_time_tasks.pop(m_id, None)
+            if task:
+                task.cancel()
 
 
 # --------------------------
