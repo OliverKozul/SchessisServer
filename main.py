@@ -518,6 +518,34 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                     continue
                 continue
 
+            if mtype in ("submit_draft", "submit_place"):
+                mid = player_match_map.get(steam_id)
+                if not mid:
+                    await websocket.send_text(json.dumps({"type": "error", "reason": "not_in_match"}))
+                    continue
+                match_obj = matches.get(mid)
+                if match_obj:
+                    a_id = match_obj["a"]
+                    b_id = match_obj["b"]
+                    next_turn = b_id if steam_id == a_id else a_id
+                    match_turn[mid] = next_turn
+                    times = match_times.get(mid) or {}
+                    for pid in [a_id, b_id]:
+                        async with ws_lock:
+                            ws = ws_connections.get(pid)
+                        if ws:
+                            try:
+                                await ws.send_text(json.dumps({
+                                    "type": "time_update",
+                                    "match_id": mid,
+                                    "your_time": times.get(pid, 0),
+                                    "opponent_time": times.get(b_id if pid == a_id else a_id, 0),
+                                    "turn": next_turn
+                                }))
+                            except Exception:
+                                pass
+                continue
+
             if mtype == "report_result":
                 # optional: client can notify server of result; reuse existing report_result endpoint logic via thread
                 # message should include opponent_id and won bool
