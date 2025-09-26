@@ -31,6 +31,7 @@ ws_lock = asyncio.Lock()
 
 db_pool: Optional[asyncpg.pool.Pool] = None
 
+
 # Per-match time tracking and timer tasks
 match_times: Dict[str, Dict[str, float]] = {}  # match_id -> {player_id: seconds_left}
 match_time_tasks: Dict[str, asyncio.Task] = {}
@@ -38,6 +39,56 @@ DEFAULT_PLAYER_TIME = 600.0  # 10 minutes in seconds
 
 # Track whose turn it is for each match
 match_turn: Dict[str, str] = {}  # match_id -> player_id
+
+# Track rematch requests: match_id -> set of player_ids who requested rematch
+pending_rematches: Dict[str, set] = {}
+
+# Shared timer task for all matches
+async def time_broadcast_task(match_id, a_id, b_id):
+    logger.info(f"Timer task started for match {match_id}")
+    while True:
+        await asyncio.sleep(1)
+        times = match_times.get(match_id)
+        turn = match_turn.get(match_id)
+        if not times or not turn:
+            break
+        logger.debug(f"Timer tick for match {match_id}: {turn} has {times[turn]}s left")
+        times[turn] = max(times[turn] - 1, 0)
+        for pid in [a_id, b_id]:
+            async with ws_lock:
+                ws = ws_connections.get(pid)
+            if ws:
+                try:
+                    await ws.send_text(json.dumps({
+                        "type": "time_update",
+                        "match_id": match_id,
+                        "your_time": times.get(pid, 0),
+                        "opponent_time": times.get(b_id if pid == a_id else a_id, 0),
+                        "turn": turn
+                    }))
+                except Exception:
+                    pass
+        if times[turn] <= 0:
+            winner = b_id if turn == a_id else a_id
+            await finalize_match(match_id, winner)
+            logger.info(f"Match {match_id}: {turn} ran out of time. Winner: {winner}")
+            for p in [a_id, b_id]:
+                async with ws_lock:
+                    ws = ws_connections.get(p)
+                if ws:
+                    try:
+                        await ws.send_text(json.dumps({
+                            "type": "time_expired",
+                            "match_id": match_id,
+                            "loser": turn,
+                            "winner": winner
+                        }))
+                    except Exception:
+                        pass
+            match_times.pop(match_id, None)
+            match_time_tasks.pop(match_id, None)
+            match_turn.pop(match_id, None)
+            return
 
 
 ############################
@@ -293,55 +344,59 @@ async def attempt_instant_match(steam_id: str, idx: Optional[int] = None):
         except Exception:
             logger.exception("Failed to send match_found to %s", b_id)
 
-    # Initialize per-player clocks and start timer task
+    # Initialize per-player clocks; timer will be started on 'start_game' relay
     match_times[match_id] = {a_id: DEFAULT_PLAYER_TIME, b_id: DEFAULT_PLAYER_TIME}
     match_turn[match_id] = host
-    async def time_broadcast_task():
-        logger.info(f"Timer task started for match {match_id}")
-        while True:
-            await asyncio.sleep(1)
-            times = match_times.get(match_id)
-            turn = match_turn.get(match_id)
-            if not times or not turn:
-                break
-            logger.debug(f"Timer tick for match {match_id}: {turn} has {times[turn]}s left")
-            times[turn] = max(times[turn] - 1, 0)
-            for pid in [a_id, b_id]:
-                async with ws_lock:
-                    ws = ws_connections.get(pid)
-                if ws:
-                    try:
-                        await ws.send_text(json.dumps({
-                            "type": "time_update",
-                            "match_id": match_id,
-                            "your_time": times.get(pid, 0),
-                            "opponent_time": times.get(b_id if pid == a_id else a_id, 0),
-                            "turn": turn
-                        }))
-                    except Exception:
-                        pass
-            if times[turn] <= 0:
-                winner = b_id if turn == a_id else a_id
-                await finalize_match(match_id, winner)
-                logger.info(f"Match {match_id}: {turn} ran out of time. Winner: {winner}")
-                for p in [a_id, b_id]:
-                    async with ws_lock:
-                        ws = ws_connections.get(p)
-                    if ws:
-                        try:
-                            await ws.send_text(json.dumps({
-                                "type": "time_expired",
-                                "match_id": match_id,
-                                "loser": turn,
-                                "winner": winner
-                            }))
-                        except Exception:
-                            pass
-                match_times.pop(match_id, None)
-                match_time_tasks.pop(match_id, None)
-                match_turn.pop(match_id, None)
-                return
-    match_time_tasks[match_id] = asyncio.create_task(time_broadcast_task())
+
+
+async def start_direct_match(a_id: str, b_id: str):
+    """Start a new match directly between two player IDs (bypassing queue)."""
+    host = a_id if a_id < b_id else b_id
+    match_id = uuid.uuid4().hex
+    # Persist and set in-memory match state
+    async with match_lock:
+        matches[match_id] = {"a": a_id, "b": b_id, "host": host, "created_at": datetime.utcnow()}
+        player_match_map[a_id] = match_id
+        player_match_map[b_id] = match_id
+    await insert_match_record(match_id, a_id, b_id, host)
+
+    # Fetch names/elo for payloads
+    a_player = await get_player(a_id)
+    b_player = await get_player(b_id)
+
+    payload_a = {
+        "type": "match_found",
+        "match_id": match_id,
+        "opponent_id": b_id,
+        "opponent_name": b_player.get("steam_name"),
+        "opponent_elo": b_player.get("elo"),
+        "host": host,
+    }
+    payload_b = {
+        "type": "match_found",
+        "match_id": match_id,
+        "opponent_id": a_id,
+        "opponent_name": a_player.get("steam_name"),
+        "opponent_elo": a_player.get("elo"),
+        "host": host,
+    }
+    async with ws_lock:
+        ws_a = ws_connections.get(a_id)
+        ws_b = ws_connections.get(b_id)
+    if ws_a:
+        try:
+            await ws_a.send_text(json.dumps(payload_a))
+        except Exception:
+            logger.exception("Failed to send match_found to %s", a_id)
+    if ws_b:
+        try:
+            await ws_b.send_text(json.dumps(payload_b))
+        except Exception:
+            logger.exception("Failed to send match_found to %s", b_id)
+
+    # Initialize clocks; timer will be started on 'start_game' relay
+    match_times[match_id] = {a_id: DEFAULT_PLAYER_TIME, b_id: DEFAULT_PLAYER_TIME}
+    match_turn[match_id] = host
 
 async def enqueue_player(steam_id: str, steam_name: str, elo: int, max_diff: int):
     idx = None
@@ -449,6 +504,14 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                         await target_ws.send_text(json.dumps(fwd))
                     except Exception:
                         logger.exception("Failed to forward relay to %s", opponent_id)
+
+                # Start timer only on 'start_game' relay, if not already running
+                if action == "start_game":
+                    match = matches.get(match_id)
+                    if match and match_id not in match_time_tasks:
+                        a_id = match["a"]
+                        b_id = match["b"]
+                        match_time_tasks[match_id] = asyncio.create_task(time_broadcast_task(match_id, a_id, b_id))
                 continue
 
             if mtype == "submit_board":
@@ -608,6 +671,50 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                 await finalize_match(mid, steam_id if won else opponent_id)
                 logger.info(f"Match {mid} finalized. Winner: {steam_id if won else opponent_id}")
                 await websocket.send_text(json.dumps({"type": "reported"}))
+                continue
+
+            if mtype == "rematch":
+                # Player requests a rematch with their current opponent
+                mid = player_match_map.get(steam_id)
+                if not mid:
+                    await websocket.send_text(json.dumps({"type": "error", "reason": "not_in_match"}))
+                    continue
+                match = matches.get(mid)
+                if not match:
+                    await websocket.send_text(json.dumps({"type": "error", "reason": "match_not_found"}))
+                    continue
+                a_id = match["a"]
+                b_id = match["b"]
+                reqs = pending_rematches.setdefault(mid, set())
+                reqs.add(steam_id)
+                # Notify both that a rematch has been requested by this player
+                for pid in [a_id, b_id]:
+                    async with ws_lock:
+                        ws = ws_connections.get(pid)
+                    if ws:
+                        try:
+                            await ws.send_text(json.dumps({
+                                "type": "rematch_requested",
+                                "match_id": mid,
+                                "by": steam_id,
+                            }))
+                        except Exception:
+                            pass
+                if a_id in reqs and b_id in reqs:
+                    # Both agreed — clear pending, clean old match time state, and start a new match
+                    pending_rematches.pop(mid, None)
+                    # Clean time/task state of the concluded match (if any running)
+                    task = match_time_tasks.pop(mid, None)
+                    if task:
+                        try:
+                            task.cancel()
+                        except Exception:
+                            pass
+                    match_times.pop(mid, None)
+                    match_turn.pop(mid, None)
+                    # Keep matches/history as-is (old match already handled as finished elsewhere per requirement)
+                    # Start a new direct match between the same players
+                    await start_direct_match(a_id, b_id)
                 continue
 
             # unknown message types ignored
