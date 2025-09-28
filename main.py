@@ -158,16 +158,16 @@ async def get_match_history(steam_id: str):
     return [{"opponent_id": r[0], "won": r[1], "timestamp": r[2]} for r in rows]
 
 async def get_player(steam_id: str, steam_name: str = "Anon"):
-    logging.debug(f"Fetching player {steam_id} from DB with name {steam_name}")
+    logging.info(f"Fetching player {steam_id} from DB with name {steam_name}")
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT steam_id, steam_name, elo, wins, losses FROM players WHERE steam_id = $1", steam_id)
-        logging.debug(f"DB returned row: {row}")
+        logging.info(f"DB returned row: {row}")
         if row:
             current_name = row[1]
             if steam_name != "Anon" and (current_name is None or current_name != steam_name):
                 await conn.execute("UPDATE players SET steam_name = $1 WHERE steam_id = $2", steam_name, steam_id)
                 current_name = steam_name
-                logging.debug(f"Updated player name for {steam_id} to {steam_name}")
+                logging.info(f"Updated player name for {steam_id} to {steam_name}")
             player = {"steam_id": row[0], "steam_name": current_name, "elo": row[2], "wins": row[3], "losses": row[4]}
         else:
             await conn.execute(
