@@ -386,11 +386,13 @@ async def start_direct_match(a_id: str, b_id: str):
     if ws_a:
         try:
             await ws_a.send_text(json.dumps(payload_a))
+            logger.info(f"Sent match_found to {a_id} for direct match {match_id}")
         except Exception:
             logger.exception("Failed to send match_found to %s", a_id)
     if ws_b:
         try:
             await ws_b.send_text(json.dumps(payload_b))
+            logger.info(f"Sent match_found to {b_id} for direct match {match_id}")
         except Exception:
             logger.exception("Failed to send match_found to %s", b_id)
 
