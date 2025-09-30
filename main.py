@@ -40,9 +40,6 @@ DEFAULT_PLAYER_TIME = 600.0  # 10 minutes in seconds
 # Track whose turn it is for each match
 match_turn: Dict[str, str] = {}  # match_id -> player_id
 
-# Track rematch requests: match_id -> set of player_ids who requested rematch
-pending_rematches: Dict[str, set] = {}
-
 # Shared timer task for all matches
 async def time_broadcast_task(match_id, a_id, b_id):
     logger.info(f"Timer task started for match {match_id}")
@@ -671,6 +668,14 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                 # finalize match record
                 mid = player_match_map.get(steam_id)
                 await finalize_match(mid, steam_id if won else opponent_id)
+                task = match_time_tasks.pop(mid, None)
+                if task:
+                    try:
+                        task.cancel()
+                    except Exception:
+                        pass
+                match_times.pop(mid, None)
+                match_turn.pop(mid, None)
                 logger.info(f"Match {mid} finalized. Winner: {steam_id if won else opponent_id}")
                 await websocket.send_text(json.dumps({"type": "reported"}))
                 continue
@@ -687,36 +692,8 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                     continue
                 a_id = match["a"]
                 b_id = match["b"]
-                reqs = pending_rematches.setdefault(mid, set())
-                reqs.add(steam_id)
-                # Notify both that a rematch has been requested by this player
-                for pid in [a_id, b_id]:
-                    async with ws_lock:
-                        ws = ws_connections.get(pid)
-                    if ws:
-                        try:
-                            await ws.send_text(json.dumps({
-                                "type": "rematch_requested",
-                                "match_id": mid,
-                                "by": steam_id,
-                            }))
-                        except Exception:
-                            pass
-                if a_id in reqs and b_id in reqs:
-                    # Both agreed — clear pending, clean old match time state, and start a new match
-                    pending_rematches.pop(mid, None)
-                    # Clean time/task state of the concluded match (if any running)
-                    task = match_time_tasks.pop(mid, None)
-                    if task:
-                        try:
-                            task.cancel()
-                        except Exception:
-                            pass
-                    match_times.pop(mid, None)
-                    match_turn.pop(mid, None)
-                    # Keep matches/history as-is (old match already handled as finished elsewhere per requirement)
-                    # Start a new direct match between the same players
-                    await start_direct_match(a_id, b_id)
+                # Start a new direct match between the same players
+                await start_direct_match(a_id, b_id)
                 continue
 
             # unknown message types ignored
