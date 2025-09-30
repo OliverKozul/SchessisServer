@@ -357,6 +357,10 @@ async def start_direct_match(a_id: str, b_id: str):
         player_match_map[b_id] = match_id
     await insert_match_record(match_id, a_id, b_id, host)
 
+    # Reset timers and turn for the new match
+    match_times[match_id] = {a_id: DEFAULT_PLAYER_TIME, b_id: DEFAULT_PLAYER_TIME}
+    match_turn[match_id] = host
+
     # Fetch names/elo for payloads
     a_player = await get_player(a_id)
     b_player = await get_player(b_id)
@@ -393,9 +397,7 @@ async def start_direct_match(a_id: str, b_id: str):
         except Exception:
             logger.exception("Failed to send match_found to %s", b_id)
 
-    # Initialize clocks; timer will be started on 'start_game' relay
-    match_times[match_id] = {a_id: DEFAULT_PLAYER_TIME, b_id: DEFAULT_PLAYER_TIME}
-    match_turn[match_id] = host
+    match_time_tasks[match_id] = asyncio.create_task(time_broadcast_task(match_id, a_id, b_id))
 
 async def enqueue_player(steam_id: str, steam_name: str, elo: int, max_diff: int):
     idx = None
