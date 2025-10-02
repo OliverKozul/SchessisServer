@@ -105,6 +105,15 @@ async def init_db_async():
                     losses INTEGER DEFAULT 0
                 )
             """)
+
+            # Drop old match_history if it exists (for migration)
+            await conn.execute("""
+                DROP TABLE IF EXISTS match_history CASCADE;
+            """)
+
+            logger.info("Dropped old match_history table if it existed.")
+
+            # Create new match_history with match_id as required field
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS match_history (
                     id SERIAL PRIMARY KEY,
@@ -116,6 +125,8 @@ async def init_db_async():
                     FOREIGN KEY (player_id) REFERENCES players (steam_id) ON DELETE CASCADE
                 )
             """)
+
+            logger.info("Created new match_history table.")
 
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS matches (
