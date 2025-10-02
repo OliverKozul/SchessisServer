@@ -108,6 +108,7 @@ async def init_db_async():
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS match_history (
                     id SERIAL PRIMARY KEY,
+                    match_id TEXT,
                     player_id TEXT,
                     opponent_id TEXT,
                     result BOOLEAN,
@@ -147,12 +148,12 @@ async def get_match_history(steam_id: str):
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT opponent_id, result, timestamp
+            SELECT match_id, opponent_id, result, timestamp
             FROM match_history
             WHERE player_id = $1
             ORDER BY timestamp DESC
             """, steam_id)
-    return [{"opponent_id": r[0], "won": r[1], "timestamp": r[2]} for r in rows]
+    return [{"match_id": r[0], "opponent_id": r[1], "won": r[2], "timestamp": r[3]} for r in rows]
 
 async def get_player(steam_id: str, steam_name: str = "Anon"):
     async with db_pool.acquire() as conn:
@@ -183,13 +184,15 @@ async def update_player(player: dict):
         )
 
 async def add_match_history(player_id: str, opponent_id: str, won: bool):
+    # Find current match_id for player
+    match_id = player_match_map.get(player_id)
     async with db_pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO match_history (player_id, opponent_id, result, timestamp)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO match_history (match_id, player_id, opponent_id, result, timestamp)
+            VALUES ($1, $2, $3, $4, $5)
             """,
-            player_id, opponent_id, won, datetime.utcnow()
+            match_id, player_id, opponent_id, won, datetime.utcnow()
         )
 
 async def insert_match_record(match_id: str, a: str, b: str, host: str):
@@ -773,7 +776,12 @@ async def get_player_info(steam_id: str, steam_name: Optional[str] = None):
     if not p:
         raise HTTPException(status_code=404, detail="Player not found")
     raw_history = await get_match_history(steam_id)
-    history = [{"opponent_id": r["opponent_id"], "won": r["won"], "timestamp": r["timestamp"].isoformat()} for r in raw_history]
+    history = [{
+        "match_id": r["match_id"],
+        "opponent_id": r["opponent_id"],
+        "won": r["won"],
+        "timestamp": r["timestamp"].isoformat()
+    } for r in raw_history]
     return {"player": p, "history": history}
 
 @app.get("/leaderboard")
