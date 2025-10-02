@@ -782,3 +782,25 @@ async def get_leaderboard():
         rows = await conn.fetch("SELECT steam_id, steam_name, elo, wins, losses FROM players ORDER BY elo DESC LIMIT 10")
     leaderboard = [{"steam_id": r[0], "steam_name": r[1], "elo": r[2], "wins": r[3], "losses": r[4]} for r in rows]
     return {"leaderboard": leaderboard}
+
+# Get initial board and all moves for a match
+@app.get("/match_state/{match_id}")
+async def get_match_state(match_id: str):
+    async with db_pool.acquire() as conn:
+        # Get initial board
+        board_row = await conn.fetchrow("SELECT initial_board FROM matches WHERE match_id = $1", match_id)
+        initial_board = None
+        if board_row and board_row[0]:
+            initial_board = json.loads(board_row[0]) if isinstance(board_row[0], str) else board_row[0]
+        # Get all moves
+        move_rows = await conn.fetch("SELECT move_number, player_id, move_data, timestamp FROM moves WHERE match_id = $1 ORDER BY move_number ASC", match_id)
+        moves = []
+        for r in move_rows:
+            move_data = json.loads(r[2]) if isinstance(r[2], str) else r[2]
+            moves.append({
+                "move_number": r[0],
+                "player_id": r[1],
+                "move_data": move_data,
+                "timestamp": r[3].isoformat() if hasattr(r[3], 'isoformat') else str(r[3])
+            })
+    return {"initial_board": initial_board, "moves": moves}
