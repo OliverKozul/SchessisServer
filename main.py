@@ -442,12 +442,27 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
     # ensure player exists and fetch elo (run DB sync in thread)
     player = await get_player(steam_id, steam_name or "Anon")
 
-    # add to matchmaking queue (event-driven)
-    await enqueue_player(steam_id, player.get("steam_name"), player.get("elo", 1000), int(max_diff or 100))
+    # Check if the player is already in a game
+    match_id = player_match_map.get(steam_id)
+    if match_id:
+        match_state = await fetch_match_state(match_id)
+        # Send the current board state and current player to the reconnecting player
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "reconnect_info",
+                "match_id": match_id,
+                "initial_board": match_state["initial_board"],
+                "moves": match_state["moves"],
+                "current_player": match_state["current_player"]
+            }))
+        except Exception as e:
+            logger.exception("Failed to send reconnect info to %s", steam_id)
+    else:
+        # add to matchmaking queue (event-driven)
+        await enqueue_player(steam_id, player.get("steam_name"), player.get("elo", 1000), int(max_diff or 100))
+        await websocket.send_text(json.dumps({"type": "queued", "elo": player.get("elo", 1000)}))
     # ack
     try:
-        await websocket.send_text(json.dumps({"type": "queued", "elo": player.get("elo", 1000)}))
-
         # main receive loop
         while True:
             raw = await websocket.receive_text()
@@ -706,27 +721,36 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
             # unknown message types ignored
     except WebSocketDisconnect:
         logger.info("WS disconnected: %s", steam_id)
+        asyncio.create_task(handle_disconnect_with_grace_period(steam_id))
     except Exception:
         logger.exception("WS error for %s", steam_id)
     finally:
-        # cleanup on disconnect
         async with ws_lock:
             ws_connections.pop(steam_id, None)
-        await remove_from_queue(steam_id)
-        async with match_lock:
-            if steam_id in player_match_map:
-                m_id = player_match_map.pop(steam_id)
-                match = matches.pop(m_id, None)
-                if match:
-                    other = match["b"] if match["a"] == steam_id else match["a"]
-                    player_match_map.pop(other, None)
-                    async with ws_lock:
-                        other_ws = ws_connections.get(other)
-                    if other_ws:
-                        try:
-                            await other_ws.send_text(json.dumps({"type": "match_cancelled", "match_id": m_id, "reason": "disconnect", "initiator": steam_id}))
-                        except Exception:
-                            pass
+
+# Add a grace period for disconnected users
+async def handle_disconnect_with_grace_period(steam_id: str):
+    await asyncio.sleep(30)  # 30-second grace period
+    async with ws_lock:
+        if steam_id in ws_connections:
+            # User reconnected within grace period
+            return
+    # Proceed with match cancellation if still disconnected
+    await remove_from_queue(steam_id)
+    async with match_lock:
+        if steam_id in player_match_map:
+            m_id = player_match_map.pop(steam_id)
+            match = matches.pop(m_id, None)
+            if match:
+                other = match["b"] if match["a"] == steam_id else match["a"]
+                player_match_map.pop(other, None)
+                async with ws_lock:
+                    other_ws = ws_connections.get(other)
+                if other_ws:
+                    try:
+                        await other_ws.send_text(json.dumps({"type": "match_cancelled", "match_id": m_id, "reason": "disconnect", "initiator": steam_id}))
+                    except Exception:
+                        pass
                 # Clean up time tracking and timer task
                 match_times.pop(m_id, None)
                 task = match_time_tasks.pop(m_id, None)
@@ -793,15 +817,15 @@ async def get_leaderboard():
     leaderboard = [{"steam_id": r[0], "steam_name": r[1], "elo": r[2], "wins": r[3], "losses": r[4]} for r in rows]
     return {"leaderboard": leaderboard}
 
-# Get initial board and all moves for a match
-@app.get("/match_state/{match_id}")
-async def get_match_state(match_id: str):
+# New database function to fetch match state
+async def fetch_match_state(match_id: str):
     async with db_pool.acquire() as conn:
         # Get initial board
         board_row = await conn.fetchrow("SELECT initial_board FROM matches WHERE match_id = $1", match_id)
         initial_board = None
         if board_row and board_row[0]:
             initial_board = json.loads(board_row[0]) if isinstance(board_row[0], str) else board_row[0]
+
         # Get all moves
         move_rows = await conn.fetch("SELECT move_number, player_id, move_data, timestamp FROM moves WHERE match_id = $1 ORDER BY move_number ASC", match_id)
         moves = []
@@ -813,4 +837,14 @@ async def get_match_state(match_id: str):
                 "move_data": move_data,
                 "timestamp": r[3].isoformat() if hasattr(r[3], 'isoformat') else str(r[3])
             })
-    return {"initial_board": initial_board, "moves": moves}
+
+        # Get current player
+        current_player = match_turn.get(match_id)
+
+    return {"initial_board": initial_board, "moves": moves, "current_player": current_player}
+
+# Get initial board and all moves for a match
+@app.get("/match_state/{match_id}")
+async def get_match_state(match_id: str):
+    match_state = await fetch_match_state(match_id)
+    return match_state
