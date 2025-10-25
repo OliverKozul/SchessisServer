@@ -451,6 +451,7 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
             await websocket.send_text(json.dumps({
                 "type": "reconnect_info",
                 "match_id": match_id,
+                "host": matches[match_id]["host"],
                 "initial_board": match_state["initial_board"],
                 "moves": match_state["moves"],
                 "current_player": match_state["current_player"]
