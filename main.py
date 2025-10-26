@@ -158,6 +158,7 @@ async def get_match_history(steam_id: str):
     return [{"match_id": r[0], "opponent_id": r[1], "won": r[2], "timestamp": r[3]} for r in rows]
 
 async def get_player(steam_id: str, steam_name: str = "Anon"):
+    is_in_game = steam_id in player_match_map
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT steam_id, steam_name, elo, wins, losses FROM players WHERE steam_id = $1", steam_id)
         if row:
@@ -165,13 +166,13 @@ async def get_player(steam_id: str, steam_name: str = "Anon"):
             if steam_name != "Anon" and (current_name is None or current_name != steam_name):
                 await conn.execute("UPDATE players SET steam_name = $1 WHERE steam_id = $2", steam_name, steam_id)
                 current_name = steam_name
-            player = {"steam_id": row[0], "steam_name": current_name, "elo": row[2], "wins": row[3], "losses": row[4]}
+            player = {"steam_id": row[0], "steam_name": current_name, "elo": row[2], "wins": row[3], "losses": row[4], "in_game": is_in_game}
         else:
             await conn.execute(
                 "INSERT INTO players (steam_id, steam_name, elo, wins, losses) VALUES ($1, $2, $3, $4, $5)",
                 steam_id, steam_name, 1000, 0, 0
             )
-            player = {"steam_id": steam_id, "steam_name": steam_name, "elo": 1000, "wins": 0, "losses": 0}
+            player = {"steam_id": steam_id, "steam_name": steam_name, "elo": 1000, "wins": 0, "losses": 0, "in_game": is_in_game}
     return player
 
 async def update_player(player: dict):
