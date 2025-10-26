@@ -730,7 +730,39 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
         async with ws_lock:
             ws_connections.pop(steam_id, None)
 
-# Add a grace period for disconnected users
+# --------------------------
+# Helper Functions
+# --------------------------
+async def cancel_match(match_id: str, initiator: str, reason: str):
+    """Cancel a match and notify the other player."""
+    async with match_lock:
+        match = matches.pop(match_id, None)
+        if match:
+            other = match["b"] if match["a"] == initiator else match["a"]
+            player_match_map.pop(initiator, None)
+            player_match_map.pop(other, None)
+            async with ws_lock:
+                other_ws = ws_connections.get(other)
+            if other_ws:
+                try:
+                    await other_ws.send_text(json.dumps({
+                        "type": "match_cancelled",
+                        "match_id": match_id,
+                        "reason": reason,
+                        "initiator": initiator
+                    }))
+                except Exception:
+                    pass
+            # Clean up time tracking and timer task
+            match_times.pop(match_id, None)
+            task = match_time_tasks.pop(match_id, None)
+            if task:
+                task.cancel()
+            match_turn.pop(match_id, None)
+
+# --------------------------
+# Grace Period Disconnect Handler
+# --------------------------
 async def handle_disconnect_with_grace_period(steam_id: str):
     await asyncio.sleep(30)  # 30-second grace period
     async with ws_lock:
@@ -741,29 +773,11 @@ async def handle_disconnect_with_grace_period(steam_id: str):
     await remove_from_queue(steam_id)
     async with match_lock:
         if steam_id in player_match_map:
-            m_id = player_match_map.pop(steam_id)
-            match = matches.pop(m_id, None)
-            if match:
-                other = match["b"] if match["a"] == steam_id else match["a"]
-                player_match_map.pop(other, None)
-                async with ws_lock:
-                    other_ws = ws_connections.get(other)
-                if other_ws:
-                    try:
-                        await other_ws.send_text(json.dumps({"type": "match_cancelled", "match_id": m_id, "reason": "disconnect", "initiator": steam_id}))
-                    except Exception:
-                        pass
-                # Clean up time tracking and timer task
-                match_times.pop(m_id, None)
-                task = match_time_tasks.pop(m_id, None)
-                if task:
-                    task.cancel()
-                match_turn.pop(m_id, None)
-
+            match_id = player_match_map[steam_id]
+            await cancel_match(match_id, steam_id, "disconnect")
 
 # --------------------------
-# Existing REST endpoints (report_result, get_player, leaderboard)
-# Keep these as-is, they call the same sync DB helpers via threads when needed.
+# Abandon Match Endpoint
 # --------------------------
 
 class MatchResult(BaseModel):
@@ -819,7 +833,9 @@ async def get_leaderboard():
     leaderboard = [{"steam_id": r[0], "steam_name": r[1], "elo": r[2], "wins": r[3], "losses": r[4]} for r in rows]
     return {"leaderboard": leaderboard}
 
-# New database function to fetch match state
+# --------------------------
+# Database Helpers
+# --------------------------
 async def fetch_match_state(match_id: str):
     async with db_pool.acquire() as conn:
         # Get initial board
@@ -850,3 +866,15 @@ async def fetch_match_state(match_id: str):
 async def get_match_state(match_id: str):
     match_state = await fetch_match_state(match_id)
     return match_state
+
+@app.post("/abandon_match/{steam_id}")
+async def abandon_match(steam_id: str):
+    # Check if the player is in a match
+    if steam_id not in player_match_map:
+        raise HTTPException(status_code=400, detail="Player is not in a match")
+
+    # Get the match ID
+    match_id = player_match_map[steam_id]
+    await cancel_match(match_id, steam_id, "abandon")
+
+    return {"detail": "Match abandoned"}
