@@ -868,7 +868,7 @@ async def get_match_state(match_id: str):
     match_state = await fetch_match_state(match_id)
     return match_state
 
-@app.post("/abandon_match/{steam_id}")
+@app.get("/abandon_match/{steam_id}")
 async def abandon_match(steam_id: str):
     # Check if the player is in a match
     if steam_id not in player_match_map:
