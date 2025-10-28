@@ -453,6 +453,7 @@ async def websocket_endpoint(websocket: WebSocket, steam_id: str, max_diff: Opti
                 "type": "reconnect_info",
                 "match_id": match_id,
                 "host": matches[match_id]["host"],
+                "opponent_id": matches[match_id]["b"] if matches[match_id]["a"] == steam_id else matches[match_id]["a"],
                 "initial_board": match_state["initial_board"],
                 "moves": match_state["moves"],
                 "current_player": match_state["current_player"]
